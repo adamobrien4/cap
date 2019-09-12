@@ -1,0 +1,1 @@
+Create function for person detection that runs once to detect values and then only compares the current values to the new value that is being added by the sensor

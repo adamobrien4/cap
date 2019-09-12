@@ -1,0 +1,299 @@
+/*
+MAKE SENSORS CALL METHODS WHEN PEOPLE ENTER UNDER THEM
+ AND ALSO WHEN PEOPLE LEAVE THEIR SENSING AREA
+
+
+
+/* Includes ------------------------------------------------------------------*/
+#include <Arduino.h>
+#include <Wire.h>
+#include <vl53l1x_x_nucleo_53l1a1_class.h>
+#include <stmpe1600_class.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <assert.h>
+#include <stdlib.h>
+
+#include <vector>
+#include <CircularBuffer.h>
+#include <Person.h>
+
+#ifdef ARDUINO_SAM_DUE
+   #define DEV_I2C Wire1
+#elif defined(ARDUINO_ARCH_STM32)
+   #define DEV_I2C Wire
+#elif defined(ARDUINO_ARCH_AVR)
+   #define DEV_I2C Wire
+#else
+   #define DEV_I2C Wire
+#endif
+
+#define SerialPort Serial
+
+//For AVR compatibility where D8 and D2 are undefined
+#ifndef D8
+#define D8 8
+#endif
+
+#ifndef D2
+#define D2 2
+#endif
+
+// Components.
+STMPE1600DigiOut *xshutdown_top;
+STMPE1600DigiOut *xshutdown_left;
+STMPE1600DigiOut *xshutdown_right;
+VL53L1_X_NUCLEO_53L1A1 *sensor_vl53l1_top;
+VL53L1_X_NUCLEO_53L1A1 *sensor_vl53l1_left;
+VL53L1_X_NUCLEO_53L1A1 *sensor_vl53l1_right;
+
+std::vector<Person> active_persons;
+bool sensor_in_use[] = {false, false, false};
+double threshold = 50;
+
+int person_count = 0;
+
+CircularBuffer<double,5> l_sensor_prev_vals;
+CircularBuffer<double,5> t_sensor_prev_vals;
+CircularBuffer<double,5> r_sensor_prev_vals;
+
+Person *l_person;
+Person *t_person;
+Person *r_person;
+
+/* Setup --------------------------------------------------------------------- */
+
+int find_in_active_persons(int sensor_code, double measurement) {
+   int closest_match_index = -1;
+   double closest_match_difference = 9999;
+
+   for( int i = 0; i < active_persons.size(); i++ ) {
+      double difference = abs(active_persons[i].measurement - measurement);
+      if( difference < closest_match_difference ) {
+         closest_match_index = i;
+         closest_match_difference = difference;
+      }
+   }
+
+   if( closest_match_difference > threshold ) {
+      // No person in active_persons list matches this person
+
+      closest_match_index = -1;
+
+      // Sensor is either left or right
+      if( sensor_code !=  1 ) {
+         Person p = Person(sensor_code, measurement);
+         active_persons.push_back(p);
+      } else {
+         // Person not found and they are at center sensor
+         // This shouldn't occur
+         // TODO: Handle this error situation
+      }
+      
+   }
+
+   return closest_match_index;
+}
+
+// Returns pointer to person object
+Person * person_entered_sensor(int sensor_code, double measurement) {
+   if ( !sensor_in_use[sensor_code] ) {
+      // Sensor is not in use
+      sensor_in_use[sensor_code] = true;
+
+      // Create pointer to what we think is the current person
+      int cur_person_index = find_in_active_persons(sensor_code, measurement);
+
+      if( cur_person_index == -1 ) {
+         // Stop execution
+         return NULL;
+      }
+
+      Person *cur_person = active_persons[cur_person_index];
+      
+      // Check that person can move to current sensor
+      switch (cur_person->cur_position) {
+         case 0:
+         case 2:
+            if( sensor_code != 1 ) {
+               // Error
+            }
+            break;
+         case 1:
+            if( sensor_code != 0 || sensor_code != 2 ) {
+               // Error
+            }
+            break;
+      }
+      
+      cur_person->cur_position = sensor_code;
+      return cur_person;
+   }
+   return NULL;
+}
+
+void person_vacated_sensor(int sensor_code, Person &cur_person) {
+
+   Serial.print("Person of measurement - ");
+   Serial.print(cur_person.measurement);
+   Serial.println(" has left the sensor");
+
+   // Person starts at 0. 0 - 2 = 2
+   // Person starts ar 2. 2 - 0 = 2
+   // Person is anywhere in between != 2
+   int person_path_value = cur_person.start_position - sensor_code;
+   Serial.print("PERSON PATH VALUE - ");
+   Serial.println(person_path_value);
+   if( person_path_value == 2 ) {
+      // Person has made full successful path between sensors
+      person_count++;
+   } else if( person_path_value == -2 ) {
+      person_count--;
+   }
+}
+
+void poll_sensor(VL53L1_X_NUCLEO_53L1A1 *sensor, CircularBuffer<double,5> &cb, int sensor_code, Person &person) {
+
+   int status;
+   uint8_t ready = 0;
+   uint16_t distance;
+
+   //Poll for measurement completion top sensor
+   do
+   {
+      sensor->VL53L1X_CheckForDataReady(&ready);
+   }
+   while (!ready);
+
+   //Get distance top
+   status = sensor->VL53L1X_GetDistance(&distance);
+
+   if (status == VL53L1_ERROR_NONE)
+   {
+      
+      if(distance > 700) {
+         // Not in person scanning range
+         return;
+      }
+
+      // Add distance onto CircularBuffer
+      cb.unshift(distance);
+
+      // Check for person
+      double biggest = 0.0;
+      double smallest = 99999999;
+      double avg = 0.0;
+
+      // Check if enough valid measurements have been taken in order to start checking if a person could be walking underneath
+      if(cb.isFull()) {
+         // Loop through all 5 elements of CircularBuffer
+         for(int i = 0; i < 5; i++) {
+            double cur = cb[i];
+            // Log biggest measurement
+            if(cur > biggest) {
+               biggest = cur;
+            }
+            // Log smallest measurement
+            if(cur < smallest) {
+               smallest = cur;
+            }
+            avg += cur;
+         }
+
+         // Get difference between the biggest and smallest measurements
+         double diff = abs(biggest - smallest);
+         // If the difference fits in our threshold, a person could has been measured
+         if( diff < threshold ) {
+            // Found person and the sensor is not in use
+            if( !sensor_in_use[sensor_code] ) {
+               Serial.println("Found person and sensor is not in use");
+
+               person = *person_entered_sensor(sensor_code, avg/5);
+
+               //person = person_entered_sensor(sensor_code, avg/5);
+               Serial.print("Persons Measurement - ");
+               Serial.println(person.measurement);
+            }
+         } else {
+            Serial.println("Sensor no longer in use");
+            // Sensor has not detected possible person
+            // Check of sensor was in use and set to available if so
+            if(sensor_in_use[sensor_code]) {
+               sensor_in_use[sensor_code] = false;
+               person_vacated_sensor(sensor_code, person);
+            }
+         }
+      }
+   }
+
+   //Clear interrupt
+   status = sensor->VL53L1X_ClearInterrupt();
+}
+
+void setup()
+{
+   // Led.
+   pinMode(13, OUTPUT);
+
+   // Initialize serial for output.
+   SerialPort.begin(115200);
+   SerialPort.println("Starting...");
+
+   // Initialize I2C bus.
+   DEV_I2C.begin();
+
+   // Create VL53L1X top component.
+   xshutdown_top = new STMPE1600DigiOut(&DEV_I2C, GPIO_15, (0x42 * 2));
+   sensor_vl53l1_top = new VL53L1_X_NUCLEO_53L1A1(&DEV_I2C, xshutdown_top, A2);
+
+   // Switch off VL53L1X top component.
+   sensor_vl53l1_top->VL53L1_Off();
+
+   // Create (if present) VL53L1X left component.
+   xshutdown_left = new STMPE1600DigiOut(&DEV_I2C, GPIO_14, (0x43 * 2));
+   sensor_vl53l1_left = new VL53L1_X_NUCLEO_53L1A1(&DEV_I2C, xshutdown_left, D8);
+
+   //Switch off (if present) VL53L1X left component.
+   sensor_vl53l1_left->VL53L1_Off();
+
+   // Create (if present) VL53L1X right component.
+   xshutdown_right = new STMPE1600DigiOut(&DEV_I2C, GPIO_15, (0x43 * 2));
+   sensor_vl53l1_right = new VL53L1_X_NUCLEO_53L1A1(&DEV_I2C, xshutdown_right, D2);
+
+   // Switch off (if present) VL53L1X right component.
+   sensor_vl53l1_right->VL53L1_Off();
+
+   //Initialize all the sensors
+   sensor_vl53l1_top->InitSensor(0x10);
+   sensor_vl53l1_left->InitSensor(0x12);
+   sensor_vl53l1_right->InitSensor(0x14);
+}
+
+void loop()
+{
+
+   delay(500);
+
+   //Led off
+   digitalWrite(13, LOW);
+
+   //Start measurement
+   sensor_vl53l1_top->VL53L1X_StartRanging();
+   sensor_vl53l1_left->VL53L1X_StartRanging();
+   sensor_vl53l1_right->VL53L1X_StartRanging();
+
+   poll_sensor(sensor_vl53l1_top, t_sensor_prev_vals, 1, t_person);
+   poll_sensor(sensor_vl53l1_left, l_sensor_prev_vals, 0, l_person);
+   poll_sensor(sensor_vl53l1_right, r_sensor_prev_vals, 2, r_person);
+
+   //Stop measurement on all sensors
+   sensor_vl53l1_top->VL53L1X_StopRanging();
+   sensor_vl53l1_left->VL53L1X_StopRanging();
+   sensor_vl53l1_right->VL53L1X_StopRanging();
+
+   Serial.print("******** ");
+   Serial.print(person_count);
+   Serial.println(" ********");
+}
